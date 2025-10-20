@@ -14,6 +14,8 @@ import ai.onnxruntime.OrtException
 import ai.onnxruntime.OrtLoggingLevel
 import ai.onnxruntime.OrtSession
 import ai.onnxruntime.providers.OrtTensorRTProviderOptions
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
 import androidx.annotation.NonNull
 import io.flutter.embedding.engine.plugins.FlutterPlugin
@@ -29,6 +31,7 @@ import java.nio.LongBuffer
 import java.nio.ShortBuffer
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.Executors
 
 /**
  * Utility class for float16 conversions
@@ -141,6 +144,12 @@ class FlutterOnnxruntimePlugin : FlutterPlugin, MethodCallHandler {
 
     // Store OrtValues (tensors) by ID
     private val ortValues = ConcurrentHashMap<String, OnnxValue>()
+
+    // Executor for running inference in background threads
+    private val executor = Executors.newCachedThreadPool()
+    
+    // Main thread handler for Platform Channel callbacks
+    private val mainHandler = Handler(Looper.getMainLooper())
 
     private fun ortTypeToString(type: OnnxJavaType): String {
         return when (type.toString()) {
@@ -322,165 +331,181 @@ class FlutterOnnxruntimePlugin : FlutterPlugin, MethodCallHandler {
                 result.success(providerList)
             }
             "runInference" -> {
-                try {
-                    val sessionId = call.argument<String>("sessionId")
-                    val inputs = call.argument<Map<String, Any>>("inputs")
-                    val runOptions = call.argument<Map<String, Any>>("runOptions")
-
-                    if (sessionId == null || !sessions.containsKey(sessionId)) {
-                        result.error("INVALID_SESSION", "Session not found", null)
-                        return
-                    }
-
-                    if (inputs == null) {
-                        result.error("INVALID_ARGUMENT", "Inputs must be a non-null map", null)
-                        return
-                    }
-
-                    val session = sessions[sessionId]!!
-                    val ortInputs = HashMap<String, OnnxValue>()
-
+                executor.execute {
                     try {
-                        // Process inputs - now expecting only OrtValue references
-                        for ((name, value) in inputs) {
-                            // Only process value as a Map with valueId
-                            if (value is Map<*, *> && value.containsKey("valueId")) {
-                                val valueId = value["valueId"] as String
-                                val existingTensor = ortValues[valueId]
-                                if (existingTensor != null) {
-                                    ortInputs[name] = existingTensor
-                                } else {
-                                    result.error(
-                                        "INVALID_ORT_VALUE",
-                                        "OrtValue with ID $valueId not found",
-                                        null,
-                                    )
-                                    return
-                                }
-                            } else {
-                                result.error(
-                                    "INVALID_INPUT_FORMAT",
-                                    "Input for '$name' must be an OrtValue reference with value ID",
-                                    null,
-                                )
-                                return
+                        val sessionId = call.argument<String>("sessionId")
+                        val inputs = call.argument<Map<String, Any>>("inputs")
+                        val runOptions = call.argument<Map<String, Any>>("runOptions")
+
+                        if (sessionId == null || !sessions.containsKey(sessionId)) {
+                            mainHandler.post {
+                                result.error("INVALID_SESSION", "Session not found", null)
                             }
+                            return@execute
                         }
 
-                        // Convert inputs to the required type for session.run
-                        val runInputs = HashMap<String, OnnxTensor>()
-                        for ((name, value) in ortInputs) {
-                            if (value is OnnxTensor) {
-                                runInputs[name] = value
+                        if (inputs == null) {
+                            mainHandler.post {
+                                result.error("INVALID_ARGUMENT", "Inputs must be a non-null map", null)
                             }
+                            return@execute
                         }
 
-                        // Create OrtSession.RunOptions if provided
-                        val ortRunOptions =
-                            if (runOptions != null && runOptions.isNotEmpty()) {
-                                val options = OrtSession.RunOptions()
+                        val session = sessions[sessionId]!!
+                        val ortInputs = HashMap<String, OnnxValue>()
 
-                                // Configure log severity level if provided
-                                if (runOptions.containsKey("logSeverityLevel")) {
-                                    val level = (runOptions["logSeverityLevel"] as Number).toInt()
-                                    val logLevel =
-                                        when (level) {
-                                            0 -> OrtLoggingLevel.ORT_LOGGING_LEVEL_VERBOSE
-                                            1 -> OrtLoggingLevel.ORT_LOGGING_LEVEL_INFO
-                                            2 -> OrtLoggingLevel.ORT_LOGGING_LEVEL_WARNING
-                                            3 -> OrtLoggingLevel.ORT_LOGGING_LEVEL_ERROR
-                                            4 -> OrtLoggingLevel.ORT_LOGGING_LEVEL_FATAL
-                                            // Handle unexpected levels
-                                            else -> OrtLoggingLevel.ORT_LOGGING_LEVEL_WARNING // default to warning
+                        try {
+                            // Process inputs - now expecting only OrtValue references
+                            for ((name, value) in inputs) {
+                                // Only process value as a Map with valueId
+                                if (value is Map<*, *> && value.containsKey("valueId")) {
+                                    val valueId = value["valueId"] as String
+                                    val existingTensor = ortValues[valueId]
+                                    if (existingTensor != null) {
+                                        ortInputs[name] = existingTensor
+                                    } else {
+                                        mainHandler.post {
+                                            result.error(
+                                                "INVALID_ORT_VALUE",
+                                                "OrtValue with ID $valueId not found",
+                                                null,
+                                            )
                                         }
-                                    options.setLogLevel(logLevel)
+                                        return@execute
+                                    }
+                                } else {
+                                    mainHandler.post {
+                                        result.error(
+                                            "INVALID_INPUT_FORMAT",
+                                            "Input for '$name' must be an OrtValue reference with value ID",
+                                            null,
+                                        )
+                                    }
+                                    return@execute
                                 }
-
-                                // Configure log verbosity level if provided
-                                if (runOptions.containsKey("logVerbosityLevel")) {
-                                    val level = (runOptions["logVerbosityLevel"] as Number).toInt()
-                                    options.setLogVerbosityLevel(level)
-                                }
-
-                                // Configure terminate flag if provided
-                                if (runOptions.containsKey("terminate")) {
-                                    val terminate = runOptions["terminate"] as Boolean
-                                    options.setTerminate(terminate)
-                                }
-
-                                options
-                            } else {
-                                null
                             }
 
-                        // Run inference with correctly typed inputs and optional run options
-                        val ortOutputs =
-                            if (ortRunOptions != null) {
-                                session.run(runInputs, ortRunOptions)
-                            } else {
-                                session.run(runInputs)
+                            // Convert inputs to the required type for session.run
+                            val runInputs = HashMap<String, OnnxTensor>()
+                            for ((name, value) in ortInputs) {
+                                if (value is OnnxTensor) {
+                                    runInputs[name] = value
+                                }
                             }
 
-                        // Process outputs
-                        // Outputs will be a map of outputName -> OrtValue parameters
-                        // OrtValue parameters are: valueId, elementType, shape
-                        val outputs = HashMap<String, Any>()
+                            // Create OrtSession.RunOptions if provided
+                            val ortRunOptions =
+                                if (runOptions != null && runOptions.isNotEmpty()) {
+                                    val options = OrtSession.RunOptions()
 
-                        // Convert tensor outputs to Flutter-compatible types
-                        for (outputName in session.outputNames) {
-                            val outputValue = ortOutputs[outputName]
-                            // create a list of outputValue parameters
-                            val outputValueParams = ArrayList<Any>()
+                                    // Configure log severity level if provided
+                                    if (runOptions.containsKey("logSeverityLevel")) {
+                                        val level = (runOptions["logSeverityLevel"] as Number).toInt()
+                                        val logLevel =
+                                            when (level) {
+                                                0 -> OrtLoggingLevel.ORT_LOGGING_LEVEL_VERBOSE
+                                                1 -> OrtLoggingLevel.ORT_LOGGING_LEVEL_INFO
+                                                2 -> OrtLoggingLevel.ORT_LOGGING_LEVEL_WARNING
+                                                3 -> OrtLoggingLevel.ORT_LOGGING_LEVEL_ERROR
+                                                4 -> OrtLoggingLevel.ORT_LOGGING_LEVEL_FATAL
+                                                // Handle unexpected levels
+                                                else -> OrtLoggingLevel.ORT_LOGGING_LEVEL_WARNING // default to warning
+                                            }
+                                        options.setLogLevel(logLevel)
+                                    }
 
-                            // Output tensor is wrapped in Optional[] for safety, unwrap the Optional if needed
-                            val outputTensor =
-                                when {
-                                    outputValue.toString().startsWith("Optional[") -> {
-                                        try {
-                                            // Try to use the get() method if available
-                                            val getMethod = outputValue.javaClass.getMethod("get")
-                                            getMethod.invoke(outputValue) as? OnnxTensor
-                                        } catch (e: Exception) {
+                                    // Configure log verbosity level if provided
+                                    if (runOptions.containsKey("logVerbosityLevel")) {
+                                        val level = (runOptions["logVerbosityLevel"] as Number).toInt()
+                                        options.setLogVerbosityLevel(level)
+                                    }
+
+                                    // Configure terminate flag if provided
+                                    if (runOptions.containsKey("terminate")) {
+                                        val terminate = runOptions["terminate"] as Boolean
+                                        options.setTerminate(terminate)
+                                    }
+
+                                    options
+                                } else {
+                                    null
+                                }
+
+                            // Run inference with correctly typed inputs and optional run options
+                            val ortOutputs =
+                                if (ortRunOptions != null) {
+                                    session.run(runInputs, ortRunOptions)
+                                } else {
+                                    session.run(runInputs)
+                                }
+
+                            // Process outputs
+                            // Outputs will be a map of outputName -> OrtValue parameters
+                            // OrtValue parameters are: valueId, elementType, shape
+                            val outputs = HashMap<String, Any>()
+
+                            // Convert tensor outputs to Flutter-compatible types
+                            for (outputName in session.outputNames) {
+                                val outputValue = ortOutputs[outputName]
+                                // create a list of outputValue parameters
+                                val outputValueParams = ArrayList<Any>()
+
+                                // Output tensor is wrapped in Optional[] for safety, unwrap the Optional if needed
+                                val outputTensor =
+                                    when {
+                                        outputValue.toString().startsWith("Optional[") -> {
                                             try {
-                                                // Fallback to orElse(null) method
-                                                val orElseMethod = outputValue.javaClass.getMethod("orElse", Object::class.java)
-                                                orElseMethod.invoke(outputValue, null) as? OnnxTensor
-                                            } catch (e2: Exception) {
-                                                Log.e("ORT_ERROR", "Failed to unwrap Optional: ${e2.message}")
-                                                null
+                                                // Try to use the get() method if available
+                                                val getMethod = outputValue.javaClass.getMethod("get")
+                                                getMethod.invoke(outputValue) as? OnnxTensor
+                                            } catch (e: Exception) {
+                                                try {
+                                                    // Fallback to orElse(null) method
+                                                    val orElseMethod = outputValue.javaClass.getMethod("orElse", Object::class.java)
+                                                    orElseMethod.invoke(outputValue, null) as? OnnxTensor
+                                                } catch (e2: Exception) {
+                                                    Log.e("ORT_ERROR", "Failed to unwrap Optional: ${e2.message}")
+                                                    null
+                                                }
                                             }
                                         }
+                                        outputValue is OnnxTensor -> outputValue
+                                        else -> null
                                     }
-                                    outputValue is OnnxTensor -> outputValue
-                                    else -> null
+
+                                if (outputTensor != null) {
+                                    // add outputTensor to ortvalues
+                                    val valueId = UUID.randomUUID().toString()
+                                    ortValues[valueId] = outputTensor
+
+                                    outputValueParams.add(valueId)
+                                    outputValueParams.add(ortTypeToString(outputTensor.info.type))
+                                    outputValueParams.add(outputTensor.info.shape.toList())
+                                } else {
+                                    val errorMessage = "Output is null or not a tensor: ${outputValue?.javaClass?.name}"
+                                    outputValueParams.add(errorMessage)
                                 }
-
-                            if (outputTensor != null) {
-                                // add outputTensor to ortvalues
-                                val valueId = UUID.randomUUID().toString()
-                                ortValues[valueId] = outputTensor
-
-                                outputValueParams.add(valueId)
-                                outputValueParams.add(ortTypeToString(outputTensor.info.type))
-                                outputValueParams.add(outputTensor.info.shape.toList())
-                            } else {
-                                val errorMessage = "Output is null or not a tensor: ${outputValue?.javaClass?.name}"
-                                outputValueParams.add(errorMessage)
+                                outputs[outputName] = outputValueParams
                             }
-                            outputs[outputName] = outputValueParams
+
+                            // Clean up run options if created
+                            ortRunOptions?.close()
+
+                            mainHandler.post {
+                                result.success(outputs)
+                            }
+                        } catch (e: Exception) {
+                            throw e
                         }
-
-                        // Clean up run options if created
-                        ortRunOptions?.close()
-
-                        result.success(outputs)
+                    } catch (e: OrtException) {
+                        mainHandler.post {
+                            result.error("INFERENCE_ERROR", e.message, e.stackTraceToString())
+                        }
                     } catch (e: Exception) {
-                        throw e
+                        mainHandler.post {
+                            result.error("PLUGIN_ERROR", e.message, e.stackTraceToString())
+                        }
                     }
-                } catch (e: OrtException) {
-                    result.error("INFERENCE_ERROR", e.message, e.stackTraceToString())
-                } catch (e: Exception) {
-                    result.error("PLUGIN_ERROR", e.message, e.stackTraceToString())
                 }
             }
             "closeSession" -> {
@@ -1107,6 +1132,8 @@ class FlutterOnnxruntimePlugin : FlutterPlugin, MethodCallHandler {
     override fun onDetachedFromEngine(
         @NonNull binding: FlutterPlugin.FlutterPluginBinding,
     ) {
+        executor.shutdown()
+        
         // Close all OrtValues
         for (value in ortValues.values) {
             try {
